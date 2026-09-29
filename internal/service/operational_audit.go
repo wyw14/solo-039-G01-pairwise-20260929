@@ -97,7 +97,10 @@ func (p *Plant) OperationalAudit() map[string]any {
 	feedPrevious := *p.Feed.Previous
 	feedCoordinator.Current = &feedCurrent
 	feedCoordinator.Previous = &feedPrevious
-	feedSwitchErr := feedCoordinator.SafeSwitch(context.Background(), feedCurrent.Source, current)
+	feedSwitchErr := func() error {
+		_, err := feedCoordinator.SafeSwitch(context.Background(), feedCurrent.Source, feedCurrent.Batch, current)
+		return err
+	}()
 	feedProof := feedCoordinator.Proof()
 	feedProofErr := feedProof.Validate()
 	feedBuiltProof := feed.BuildSwitchProof(feedCoordinator.Previous, feedCoordinator.Current)

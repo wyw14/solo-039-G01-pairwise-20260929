@@ -27,6 +27,7 @@ type Plant struct {
 	Campaign          *campaign.State
 	Column            *column.State
 	Feed              *feed.Coordinator
+	FeedRegistry      *feed.Registry
 	Reflux            *reflux.Coordinator
 	RefluxState       *reflux.State
 	Reboiler          *reboiler.State
@@ -65,6 +66,7 @@ func NewPlant(dataDir string) *Plant {
 		Campaign:          campaignState,
 		Column:            column.New("T-101"),
 		Feed:              feed.NewCoordinator(),
+		FeedRegistry:      feed.NewRegistry(),
 		Reflux:            refluxCoordinator,
 		RefluxState:       reflux.New(),
 		Reboiler:          reboiler.New(),
@@ -92,14 +94,52 @@ func NewPlant(dataDir string) *Plant {
 		Incidents:         NewIncidents(),
 	}
 	plant.Reflux.Register("T-101", plant.RefluxState)
+	plant.Feed.Gate = plant.FeedRegistry
 	plant.Feed.Observe = plant.observeFeed
 	return plant
 }
 
-func (p *Plant) Start(ctx context.Context, grade, source string) (model.Campaign, error) {
+// authorizeFeed admits the feed batch for the target grade before any plant
+// state changes. Expired certificates, failed reinspections and batches
+// outside the grade window are refused here.
+func (p *Plant) authorizeFeed(source, batch, grade string) (feed.Authorization, error) {
+	auth, err := p.FeedRegistry.Authorize(source, batch, grade, time.Now().Unix())
+	if err != nil {
+		p.fail(err)
+		return auth, err
+	}
+	if !auth.Allowed {
+		err := feed.RejectedError{Authorization: auth}
+		p.fail(err)
+		return auth, err
+	}
+	return auth, nil
+}
+
+// recordFeedUse links the active production campaign to the charged feed
+// batch so the batch can later be traced to affected production batches.
+func (p *Plant) recordFeedUse(source, batch string, auth feed.Authorization, current model.Campaign) {
+	p.FeedRegistry.RecordUsage(feed.FeedUse{
+		Batch:       batch,
+		Certificate: auth.Certificate,
+		Source:      source,
+		Campaign:    current.ID,
+		Revision:    current.Revision,
+		Grade:       current.Grade,
+		Qty:         auth.AllowedQty,
+		At:          time.Now().Unix(),
+	})
+}
+
+func (p *Plant) Start(ctx context.Context, grade, source, batch string) (model.Campaign, error) {
 	var operationErr error
 	defer func() { p.Metrics.Record("start", operationErr) }()
 	if err := model.ValidateGrade(grade); err != nil {
+		operationErr = err
+		return model.Campaign{}, err
+	}
+	auth, err := p.authorizeFeed(source, batch, grade)
+	if err != nil {
 		operationErr = err
 		return model.Campaign{}, err
 	}
@@ -117,11 +157,12 @@ func (p *Plant) Start(ctx context.Context, grade, source string) (model.Campaign
 	current.Grade = grade
 	campaign.Restore(p.Campaign, current)
 	p.CampaignHistory.Record(before, current, "start grade selected")
-	if err := p.Feed.Switch(ctx, source, current); err != nil {
+	if _, err := p.Feed.Switch(ctx, source, batch, current); err != nil {
 		operationErr = err
 		p.fail(err)
 		return model.Campaign{}, err
 	}
+	p.recordFeedUse(source, batch, auth, current)
 	p.Column.SetFeedRevision(p.Feed.Current.Revision)
 	p.Analyzer.BindFeed(p.Feed.Current.Revision)
 	p.Campaign.Advance(model.Warming)
@@ -135,7 +176,7 @@ func (p *Plant) Start(ctx context.Context, grade, source string) (model.Campaign
 	_ = p.Profile.Put(column.TrayReading{Tray: 1, Temperature: 118, Pressure: 1.1})
 	_ = p.Profile.Put(column.TrayReading{Tray: 20, Temperature: 82, Pressure: 0.9})
 	p.ReboilerTelemetry.Record(p.Reboiler.Snapshot())
-	if err := p.record("plant.started", source); err != nil {
+	if err := p.record("plant.started", source+":"+batch); err != nil {
 		p.fail(err)
 		operationErr = err
 		return model.Campaign{}, err
@@ -143,8 +184,12 @@ func (p *Plant) Start(ctx context.Context, grade, source string) (model.Campaign
 	return p.Campaign.Snapshot(), nil
 }
 
-func (p *Plant) Transition(ctx context.Context, grade, source string) (model.Campaign, error) {
+func (p *Plant) Transition(ctx context.Context, grade, source, batch string) (model.Campaign, error) {
 	if err := model.ValidateGrade(grade); err != nil {
+		return model.Campaign{}, err
+	}
+	auth, err := p.authorizeFeed(source, batch, grade)
+	if err != nil {
 		return model.Campaign{}, err
 	}
 	before := p.Campaign.Snapshot()
@@ -153,14 +198,15 @@ func (p *Plant) Transition(ctx context.Context, grade, source string) (model.Cam
 	current.Revision = uuid.New()
 	campaign.Restore(p.Campaign, current)
 	p.CampaignHistory.Record(before, current, "grade transition")
-	if err := p.Feed.Switch(ctx, source, current); err != nil {
+	if _, err := p.Feed.Switch(ctx, source, batch, current); err != nil {
 		p.fail(err)
 		return model.Campaign{}, err
 	}
+	p.recordFeedUse(source, batch, auth, current)
 	p.Column.SetFeedRevision(p.Feed.Current.Revision)
 	p.FeedMetrics.Record(source)
 	p.Analyzer.BindFeed(p.Feed.Current.Revision)
-	if err := p.record("campaign.transition", grade); err != nil {
+	if err := p.record("campaign.transition", grade+":"+batch); err != nil {
 		p.fail(err)
 		return model.Campaign{}, err
 	}
@@ -284,7 +330,7 @@ func (p *Plant) Status() map[string]any {
 	lastError := p.lastError
 	p.mu.RUnlock()
 	gradient, _ := p.Profile.Gradient()
-	return map[string]any{"started": started, "last_error": lastError, "campaign": p.Campaign.Snapshot(), "column": p.Column.Snapshot(), "reflux_used": p.Reflux.Used(), "products": p.ProductTargets(), "relief": p.Relief.State.Snapshot(), "feed_metrics": p.FeedMetrics.Snapshot(), "reflux_telemetry": p.RefluxTelemetry.Snapshot(), "reboiler_telemetry": p.ReboilerTelemetry.Snapshot(), "product_decisions": p.ProductAudit.Count(), "utility_used": p.UtilityLedger.Used(), "metrics": p.Metrics.Snapshot(), "campaign_changes": p.CampaignHistory.Count(), "profile_gradient": gradient, "profile_stable": p.Profile.Stable(40), "evidence_count": p.Evidence.Count(p.Campaign.Snapshot().Revision.String()), "relief_attempts": p.ReliefHistory.Count(), "open_incidents": p.Incidents.CountOpen(), "operational_audit": p.OperationalAudit()}
+	return map[string]any{"started": started, "last_error": lastError, "campaign": p.Campaign.Snapshot(), "column": p.Column.Snapshot(), "reflux_used": p.Reflux.Used(), "products": p.ProductTargets(), "relief": p.Relief.State.Snapshot(), "feed_metrics": p.FeedMetrics.Snapshot(), "feed_admission": p.CurrentFeedAuthorization(), "reflux_telemetry": p.RefluxTelemetry.Snapshot(), "reboiler_telemetry": p.ReboilerTelemetry.Snapshot(), "product_decisions": p.ProductAudit.Count(), "utility_used": p.UtilityLedger.Used(), "metrics": p.Metrics.Snapshot(), "campaign_changes": p.CampaignHistory.Count(), "profile_gradient": gradient, "profile_stable": p.Profile.Stable(40), "evidence_count": p.Evidence.Count(p.Campaign.Snapshot().Revision.String()), "relief_attempts": p.ReliefHistory.Count(), "open_incidents": p.Incidents.CountOpen(), "operational_audit": p.OperationalAudit()}
 }
 
 func (p *Plant) record(kind, payload string) error {
@@ -300,7 +346,7 @@ func (p *Plant) record(kind, payload string) error {
 }
 
 func (p *Plant) observeFeed(value feed.Transition) {
-	payload := fmt.Sprintf("%s:%s:%t:%.2f:%s:%t", value.Stage, value.OldSource, value.OldOpen, value.OldFlow, value.NewSource, value.NewOpen)
+	payload := fmt.Sprintf("%s:%s:%t:%.2f:%s:%t:%s", value.Stage, value.OldSource, value.OldOpen, value.OldFlow, value.NewSource, value.NewOpen, value.Batch)
 	if err := p.record("feed.transition", payload); err != nil {
 		p.fail(err)
 	}

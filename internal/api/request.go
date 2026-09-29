@@ -10,6 +10,35 @@ import (
 type transitionRequest struct {
 	Grade  string `json:"grade"`
 	Source string `json:"source"`
+	Batch  string `json:"batch"`
+}
+type assayInput struct {
+	Components  map[string]float64 `json:"components"`
+	Water       float64            `json:"water"`
+	Impurities  float64            `json:"impurities"`
+	SampleBatch string             `json:"sample_batch"`
+	SampledAt   int64              `json:"sampled_at"`
+}
+type certificateRequest struct {
+	Source     string     `json:"source"`
+	Batch      string     `json:"batch"`
+	Grade      string     `json:"grade"`
+	ValidUntil int64      `json:"valid_until"`
+	Assay      assayInput `json:"assay"`
+}
+type reinspectRequest struct {
+	Batch       string `json:"batch"`
+	SampleBatch string `json:"sample_batch"`
+	Passed      bool   `json:"passed"`
+	Reason      string `json:"reason"`
+}
+type gradeSpecRequest struct {
+	Grade           string             `json:"grade"`
+	MinComponents   map[string]float64 `json:"min_components"`
+	MaxComponents   map[string]float64 `json:"max_components"`
+	MaxWater        float64            `json:"max_water"`
+	MaxImpurities   float64            `json:"max_impurities"`
+	MaxAllowableQty float64            `json:"max_allowable_qty"`
 }
 type sampleRequest struct {
 	Value float64 `json:"value"`

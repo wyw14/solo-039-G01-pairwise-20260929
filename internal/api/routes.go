@@ -15,6 +15,11 @@ func (s *Server) routes() {
 	s.router.Post("/api/analyzer/calibrate", s.calibrate)
 	s.router.Post("/api/products/route", s.routeProduct)
 	s.router.Post("/api/reflux/leases", s.lease)
+	s.router.Post("/api/feed/certificates", s.issueCertificate)
+	s.router.Get("/api/feed/certificates", s.listCertificates)
+	s.router.Post("/api/feed/reinspect", s.reinspectBatch)
+	s.router.Post("/api/feed/grade-specs", s.registerGradeSpec)
+	s.router.Get("/api/feed/trace", s.traceFeedBatch)
 	s.router.Post("/api/shutdown", s.shutdown)
 	s.router.Get("/api/snapshot", s.snapshot)
 	s.router.Get("/api/evidence", s.evidence)
@@ -42,7 +47,8 @@ func (s *Server) start(w http.ResponseWriter, r *http.Request) {
 	if source == "" {
 		source = "primary"
 	}
-	if _, err := s.plant.Start(r.Context(), grade, source); err != nil {
+	batch := r.URL.Query().Get("batch")
+	if _, err := s.plant.Start(r.Context(), grade, source, batch); err != nil {
 		writeJSON(w, http.StatusConflict, map[string]string{"error": err.Error()})
 		return
 	}
