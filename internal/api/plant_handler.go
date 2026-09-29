@@ -11,7 +11,7 @@ func (s *Server) transition(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
 		return
 	}
-	value, err := s.plant.Transition(r.Context(), input.Grade, input.Source)
+	value, err := s.plant.Transition(r.Context(), input.Grade, input.Source, input.Batch)
 	if err != nil {
 		writeJSON(w, http.StatusConflict, map[string]string{"error": err.Error()})
 		return

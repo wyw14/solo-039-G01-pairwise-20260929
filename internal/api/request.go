@@ -10,6 +10,12 @@ import (
 type transitionRequest struct {
 	Grade  string `json:"grade"`
 	Source string `json:"source"`
+	Batch  string `json:"batch"`
+}
+type recheckRequest struct {
+	Source string `json:"source"`
+	Batch  string `json:"batch"`
+	Reason string `json:"reason"`
 }
 type sampleRequest struct {
 	Value float64 `json:"value"`

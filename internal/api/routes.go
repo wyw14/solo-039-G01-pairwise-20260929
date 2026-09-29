@@ -11,6 +11,10 @@ func (s *Server) routes() {
 	s.router.Get("/api/incidents", s.incidents)
 	s.router.Post("/api/campaign/start", s.start)
 	s.router.Post("/api/campaign/transition", s.transition)
+	s.router.Post("/api/feed/certificates", s.issueFeedCertificate)
+	s.router.Post("/api/feed/rechecks", s.failFeedRecheck)
+	s.router.Get("/api/feed/certificates", s.listFeedCertificates)
+	s.router.Get("/api/feed/trace", s.traceFeedBatch)
 	s.router.Post("/api/analyzer/samples", s.sample)
 	s.router.Post("/api/analyzer/calibrate", s.calibrate)
 	s.router.Post("/api/products/route", s.routeProduct)
@@ -42,7 +46,8 @@ func (s *Server) start(w http.ResponseWriter, r *http.Request) {
 	if source == "" {
 		source = "primary"
 	}
-	if _, err := s.plant.Start(r.Context(), grade, source); err != nil {
+	batch := r.URL.Query().Get("batch")
+	if _, err := s.plant.Start(r.Context(), grade, source, batch); err != nil {
 		writeJSON(w, http.StatusConflict, map[string]string{"error": err.Error()})
 		return
 	}

@@ -14,6 +14,7 @@ import (
 	"github.com/wyw14/solo-039/internal/reflux"
 	"github.com/wyw14/solo-039/internal/relief"
 	"github.com/wyw14/solo-039/internal/utility"
+	"time"
 )
 
 func auditError(err error) string {
@@ -111,6 +112,38 @@ func (p *Plant) OperationalAudit() map[string]any {
 	feedMetrics.Record(feedCurrent.Source)
 	feedMetricSnapshot := feedMetrics.Snapshot()
 	feedMetrics.Reset()
+
+	// Feed-batch fitness gate: re-judge the lot currently cut in against the
+	// campaign grade so the audit surfaces an expired/rejected certificate.
+	feedAuditBatch := ""
+	for _, usage := range p.FeedUsage.ForCampaign(current.ID) {
+		if usage.FeedSource == feedCurrent.Source {
+			feedAuditBatch = usage.FeedBatch
+		}
+	}
+	feedCertCount := len(p.FeedCerts.List())
+	feedUsageCount := p.FeedUsage.Count()
+	feedGateErr := ""
+	feedGateAllowed := false
+	feedUsableAmount := 0.0
+	feedCertPresent := false
+	if feedAuditBatch != "" {
+		decision, _, judgeErr := p.FeedCerts.Judge(feedCurrent.Source, feedAuditBatch, current.Grade, time.Now())
+		feedCertPresent = true
+		if judgeErr != nil {
+			feedGateErr = auditError(judgeErr)
+		} else {
+			feedGateAllowed = decision.Allowed
+			feedUsableAmount = decision.UsableAmount
+			if !decision.Allowed && len(decision.Reasons) > 0 {
+				feedGateErr = decision.Reasons[0]
+			}
+		}
+	}
+	feedTraceCount := 0
+	if feedAuditBatch != "" {
+		feedTraceCount = len(p.FeedUsage.ForFeedBatch(feedCurrent.Source, feedAuditBatch))
+	}
 
 	permit := p.Interlock.Evaluate(proofs, current)
 	explanation := interlock.Explain(permit)
@@ -306,7 +339,7 @@ func (p *Plant) OperationalAudit() map[string]any {
 		"analyzer":  map[string]any{"compatible": analyzer.Compatible(analyzerRecovery, analyzerRecovery.Calibration, analyzerRecovery.FeedRevision), "proof": analyzerProofOK, "quality_error": auditError(qualityErr), "quality_proof_error": auditError(qualityProofErr), "last_proof": analyzerClone.LastProof(), "catalog_count": analyzerCatalog.Count(revision)},
 		"campaign":  map[string]any{"phase_error": auditError(phaseErr), "revision_matches": revisionMatches, "can_route": canRoute, "advance_error": auditError(advanceErr), "lease_applied": leaseApplied, "restarted": restarted.Phase, "transitioned": transitioned.Phase, "completed": completed.Phase, "start_error": auditError(campaignStartErr), "running_error": auditError(campaignRunningErr), "history_present": historyPresent, "history_latest": historyLatest, "history_for_revision": len(historyForRevision), "history_phases": historyPhases},
 		"column":    map[string]any{"apply_error": auditError(columnApplyErr), "ready": columnReady, "snapshot_valid": columnSnapshotValid, "stable": columnStable, "heat_permit": columnHeatPermit, "recovery_ready": columnRecoveryReady, "profile_count": p.Profile.Count()},
-		"feed":      map[string]any{"switch_error": auditError(feedSwitchErr), "proof_error": auditError(feedProofErr), "proof_safe": feedProof.Safe(), "built_proof_safe": feedBuiltProof.Safe(), "route_isolated": feedCoordinator.Current.Isolated(), "route_event": feedRouteEvent.ID, "open_error": auditError(feedOpenErr), "active": feedActive, "revision": feedStateRevision, "close_error": auditError(feedCloseErr), "metrics": feedMetricSnapshot},
+		"feed":      map[string]any{"switch_error": auditError(feedSwitchErr), "proof_error": auditError(feedProofErr), "proof_safe": feedProof.Safe(), "built_proof_safe": feedBuiltProof.Safe(), "route_isolated": feedCoordinator.Current.Isolated(), "route_event": feedRouteEvent.ID, "open_error": auditError(feedOpenErr), "active": feedActive, "revision": feedStateRevision, "close_error": auditError(feedCloseErr), "metrics": feedMetricSnapshot, "certificate_present": feedCertPresent, "certificates": feedCertCount, "usages": feedUsageCount, "fitness_batch": feedAuditBatch, "fitness_allowed": feedGateAllowed, "fitness_error": feedGateErr, "usable_amount": feedUsableAmount, "traceable_batches": feedTraceCount},
 		"interlock": map[string]any{"explanation": explanation, "sources": evidenceSources, "same_source": sameSource, "heat": heatPermit.Allowed, "route": routePermit, "restored": restoredPermit.Allowed, "recovery_safe": recoverySafe},
 		"journal":   map[string]any{"sequence_error": auditError(sequenceErr), "latest": latestEventPresent, "checkpoint_valid": checkpointValid, "file_path": p.FileLog.Path(), "file_events": len(fileEvents), "file_error": auditError(fileReadErr), "durable_proof": durableProofPresent, "proof_error": auditError(durableProofErr), "recovery_error": auditError(recoveryValidationErr), "recovery_events": len(recoveryEvents), "replay_events": len(replayEvents), "campaign_events": replayedForCampaign, "state_ready": recoveredState.Ready(), "plan_complete": recoveryPlan.Complete(), "generations": len(eventGenerations), "loaded_campaign": loadedSnapshot.Campaign.ID, "load_error": auditError(snapshotLoadErr), "failure_probe_rejected": journalProbeErr != nil},
 		"model":     map[string]any{"plan_error": auditError(planErr), "command_error": auditError(commandErr), "command_key": command.Key(), "ack_matches": ackMatches, "ack_error": auditError(ackErr), "column_limit_error": auditError(columnLimitErr), "energy_limit_error": auditError(energyLimitErr), "safe": limitSafe},

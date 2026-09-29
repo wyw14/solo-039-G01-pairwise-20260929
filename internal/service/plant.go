@@ -9,6 +9,7 @@ import (
 	"github.com/wyw14/solo-039/internal/campaign"
 	"github.com/wyw14/solo-039/internal/column"
 	"github.com/wyw14/solo-039/internal/feed"
+	"github.com/wyw14/solo-039/internal/feedcert"
 	"github.com/wyw14/solo-039/internal/interlock"
 	"github.com/wyw14/solo-039/internal/journal"
 	"github.com/wyw14/solo-039/internal/model"
@@ -51,6 +52,8 @@ type Plant struct {
 	ReboilerCommands  *reboiler.CommandBook
 	Evidence          *analyzer.EvidenceCatalog
 	ReliefHistory     *relief.History
+	FeedCerts         *feedcert.Registry
+	FeedUsage         *feedcert.UsageLedger
 	Incidents         *Incidents
 	started           bool
 	lastError         string
@@ -89,6 +92,8 @@ func NewPlant(dataDir string) *Plant {
 		ReboilerCommands:  reboiler.NewCommandBook(),
 		Evidence:          analyzer.NewEvidenceCatalog(),
 		ReliefHistory:     relief.NewHistory(),
+		FeedCerts:         newFeedRegistry(),
+		FeedUsage:         feedcert.NewUsageLedger(),
 		Incidents:         NewIncidents(),
 	}
 	plant.Reflux.Register("T-101", plant.RefluxState)
@@ -96,7 +101,7 @@ func NewPlant(dataDir string) *Plant {
 	return plant
 }
 
-func (p *Plant) Start(ctx context.Context, grade, source string) (model.Campaign, error) {
+func (p *Plant) Start(ctx context.Context, grade, source, batch string) (model.Campaign, error) {
 	var operationErr error
 	defer func() { p.Metrics.Record("start", operationErr) }()
 	if err := model.ValidateGrade(grade); err != nil {
@@ -117,11 +122,21 @@ func (p *Plant) Start(ctx context.Context, grade, source string) (model.Campaign
 	current.Grade = grade
 	campaign.Restore(p.Campaign, current)
 	p.CampaignHistory.Record(before, current, "start grade selected")
+	decision, cert, err := p.authorizeFeed(source, batch, grade)
+	if err != nil {
+		operationErr = err
+		p.mu.Lock()
+		p.started = false
+		p.mu.Unlock()
+		p.fail(err)
+		return model.Campaign{}, err
+	}
 	if err := p.Feed.Switch(ctx, source, current); err != nil {
 		operationErr = err
 		p.fail(err)
 		return model.Campaign{}, err
 	}
+	p.recordFeedUsage(source, batch, grade, cert, decision, current)
 	p.Column.SetFeedRevision(p.Feed.Current.Revision)
 	p.Analyzer.BindFeed(p.Feed.Current.Revision)
 	p.Campaign.Advance(model.Warming)
@@ -143,11 +158,19 @@ func (p *Plant) Start(ctx context.Context, grade, source string) (model.Campaign
 	return p.Campaign.Snapshot(), nil
 }
 
-func (p *Plant) Transition(ctx context.Context, grade, source string) (model.Campaign, error) {
+func (p *Plant) Transition(ctx context.Context, grade, source, batch string) (model.Campaign, error) {
 	if err := model.ValidateGrade(grade); err != nil {
 		return model.Campaign{}, err
 	}
 	before := p.Campaign.Snapshot()
+	// Gate the cut-in on the feed-batch fitness certificate before the
+	// campaign revision advances: an expired or rejected lot must not leave
+	// a half-transitioned campaign behind.
+	decision, cert, err := p.authorizeFeed(source, batch, grade)
+	if err != nil {
+		p.fail(err)
+		return model.Campaign{}, err
+	}
 	current := p.Campaign.Advance(model.Transitioning)
 	current.Grade = grade
 	current.Revision = uuid.New()
@@ -157,6 +180,7 @@ func (p *Plant) Transition(ctx context.Context, grade, source string) (model.Cam
 		p.fail(err)
 		return model.Campaign{}, err
 	}
+	p.recordFeedUsage(source, batch, grade, cert, decision, current)
 	p.Column.SetFeedRevision(p.Feed.Current.Revision)
 	p.FeedMetrics.Record(source)
 	p.Analyzer.BindFeed(p.Feed.Current.Revision)
@@ -284,7 +308,7 @@ func (p *Plant) Status() map[string]any {
 	lastError := p.lastError
 	p.mu.RUnlock()
 	gradient, _ := p.Profile.Gradient()
-	return map[string]any{"started": started, "last_error": lastError, "campaign": p.Campaign.Snapshot(), "column": p.Column.Snapshot(), "reflux_used": p.Reflux.Used(), "products": p.ProductTargets(), "relief": p.Relief.State.Snapshot(), "feed_metrics": p.FeedMetrics.Snapshot(), "reflux_telemetry": p.RefluxTelemetry.Snapshot(), "reboiler_telemetry": p.ReboilerTelemetry.Snapshot(), "product_decisions": p.ProductAudit.Count(), "utility_used": p.UtilityLedger.Used(), "metrics": p.Metrics.Snapshot(), "campaign_changes": p.CampaignHistory.Count(), "profile_gradient": gradient, "profile_stable": p.Profile.Stable(40), "evidence_count": p.Evidence.Count(p.Campaign.Snapshot().Revision.String()), "relief_attempts": p.ReliefHistory.Count(), "open_incidents": p.Incidents.CountOpen(), "operational_audit": p.OperationalAudit()}
+	return map[string]any{"started": started, "last_error": lastError, "campaign": p.Campaign.Snapshot(), "column": p.Column.Snapshot(), "reflux_used": p.Reflux.Used(), "products": p.ProductTargets(), "relief": p.Relief.State.Snapshot(), "feed_metrics": p.FeedMetrics.Snapshot(), "feed_fitness": p.CurrentFeedFitness(), "feed_certificates": len(p.FeedCerts.List()), "feed_usages": p.FeedUsage.Count(), "reflux_telemetry": p.RefluxTelemetry.Snapshot(), "reboiler_telemetry": p.ReboilerTelemetry.Snapshot(), "product_decisions": p.ProductAudit.Count(), "utility_used": p.UtilityLedger.Used(), "metrics": p.Metrics.Snapshot(), "campaign_changes": p.CampaignHistory.Count(), "profile_gradient": gradient, "profile_stable": p.Profile.Stable(40), "evidence_count": p.Evidence.Count(p.Campaign.Snapshot().Revision.String()), "relief_attempts": p.ReliefHistory.Count(), "open_incidents": p.Incidents.CountOpen(), "operational_audit": p.OperationalAudit()}
 }
 
 func (p *Plant) record(kind, payload string) error {
